@@ -1,0 +1,406 @@
+# Prueba pedagógica mínima: RabbitMQ + carga con k6
+
+**Contexto:** ecosistema Spring Cloud (Config, Eureka, Auth, Inventory, Gateway) con publicación del evento de **producto creado** hacia RabbitMQ (exchange `inventory.exchange`, routing key `product.created`, cola `product.created.queue`) y consumo en `notification-service`.
+
+**Objetivo:** que quien ejecuta la práctica pueda (1) levantar el **camino mínimo** con mensajería, (2) **verificar** el flujo con un request manual, (3) **simular muchos usuarios** con k6 y (4) **relacionar** métricas HTTP con el estado de la cola en RabbitMQ.
+
+---
+
+## 1. Qué vas a demostrar
+
+- Tráfico HTTP concurrente al **API Gateway** al crear productos.
+- El **inventory-service** persiste y **publica** un evento al broker.
+- El **notification-service** **consume** y deja evidencia en logs.
+- Bajo carga, conviene preguntarse: ¿qué satura primero? (JVM/gateway/inventario/BD vs profundidad de cola en RabbitMQ).
+
+---
+
+## 2. Prerrequisitos
+
+- Repo clonado; **Java 21** y **Maven 3.8+**.
+- **RabbitMQ** accesible (AMQP **5672**; UI de gestión **15672** si tenés el plugin `rabbitmq_management`).
+- **[k6](https://k6.io/docs/get-started/installation/)** instalado para la parte de carga.
+- Terminal(es) para correr varios `mvn spring-boot:run` **o** el método que uses en Codespaces.
+
+> **Codespaces:** los servicios suelen escuchar en `localhost` dentro del entorno. k6 puede ejecutarse **en la misma máquina/Codespace** pegándole a `http://localhost:8080`. Si querés cargar desde **fuera**, necesitás una URL pública del puerto reenviado y permisos de acceso (público o token, según política de GitHub).
+
+### 2.1 Instalar RabbitMQ (Windows, macOS, Linux)
+
+No hace falta “instalar en el disco” si usás **Docker**: alcanza con tener el broker **accesible** en **5672** (AMQP) y **15672** (UI con plugin `rabbitmq_management`). Documentación oficial por plataforma: [Windows](https://www.rabbitmq.com/docs/install-windows), [macOS/Homebrew](https://www.rabbitmq.com/docs/install-homebrew), [Linux Debian/Ubuntu](https://www.rabbitmq.com/docs/install-debian).
+
+**Gestores de paquetes:** [Chocolatey](https://chocolatey.org/) (`choco`) es **solo para Windows**. En macOS el equivalente habitual es **Homebrew** (`brew`); en Linux suelen usarse **APT** / **DNF** (o el repo oficial de RabbitMQ para versiones recientes). Si preferís no depender del SO, usá **Docker** (más abajo).
+
+#### Windows
+
+La guía oficial de RabbitMQ para Windows propone **Chocolatey** o el **instalador .exe**. Detalle: [Installing on Windows](https://www.rabbitmq.com/docs/install-windows).
+
+##### Opción A — Chocolatey
+
+1. Tené [Chocolatey](https://chocolatey.org/install) instalado.
+2. En **PowerShell como administrador**:
+
+   ```powershell
+   choco install rabbitmq -y
+   ```
+
+   Suele encargarse también de dependencias (p. ej. Erlang). Ojo: los paquetes en Chocolatey **pueden tardar semanas** en alinearse con el último RabbitMQ publicado; si necesitás una versión muy nueva, usá el instalador oficial o Docker.
+
+3. Habilitá la UI de gestión si hace falta (desde el acceso directo al shell en `sbin` del menú Inicio, o con PATH configurado):
+
+   ```powershell
+   rabbitmq-plugins.bat enable rabbitmq_management
+   ```
+
+4. Abrí http://localhost:15672 (`guest` / `guest` en instalación local típica).
+
+##### Opción B — Instalador oficial (.exe)
+
+1. Instalá **Erlang/OTP** en una versión **compatible** con la versión de RabbitMQ que vayas a usar (tabla en la doc oficial).
+2. Instalá **RabbitMQ** con el instalador `rabbitmq-server-{version}.exe` desde [GitHub Releases](https://github.com/rabbitmq/rabbitmq-server/releases) o la [página de descargas](https://www.rabbitmq.com/download.html).
+3. El broker suele quedar como **servicio de Windows**. Para la UI de gestión, en una terminal **como administrador** (desde la carpeta `sbin` de RabbitMQ si hace falta):
+
+   ```powershell
+   rabbitmq-plugins.bat enable rabbitmq_management
+   ```
+
+4. Abrí http://localhost:15672 (credenciales por defecto típicas: `guest` / `guest` en instalación local).
+
+> En Windows los ejecutables CLI suelen llevar sufijo **`.bat`** (`rabbitmqctl.bat`, etc.); si usás el “RabbitMQ Command Prompt” del menú Inicio, ya estás en el contexto correcto.
+
+#### macOS (Homebrew)
+
+```bash
+brew install rabbitmq
+brew services start rabbitmq
+rabbitmq-plugins enable rabbitmq_management
+```
+
+Verificá http://localhost:15672 y el puerto AMQP **5672**.
+
+#### Linux (Debian / Ubuntu)
+
+Para versiones recientes conviene seguir la guía oficial (**repositorio APT de RabbitMQ**). Opción rápida en muchas VMs académicas (versiones pueden ser más viejas):
+
+```bash
+sudo apt update
+sudo apt install -y rabbitmq-server
+sudo systemctl enable --now rabbitmq-server
+sudo rabbitmq-plugins enable rabbitmq_management
+```
+
+En **Fedora/RHEL** el paquete suele llamarse también `rabbitmq-server`; usá `dnf install` / `systemctl` equivalente.
+
+#### Docker (Windows, macOS, Linux, GitHub Codespaces)
+
+Útil cuando no querés instalar Erlang/RabbitMQ nativos o cuando trabajás en un Codespace con Docker disponible:
+
+```bash
+docker run -d --hostname rabbitmq --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
+
+La imagen `management` ya incluye la UI en **15672**. En Codespaces, reenviá el puerto **15672** desde la pestaña **Ports** si querés abrir la consola web desde tu navegador.
+
+#### Verificación común
+
+- AMQP escuchando en **5672** (lo usan inventory / notification).
+- UI en **http://localhost:15672** si habilitaste `rabbitmq_management` (nativo) o usás la imagen Docker indicada.
+
+### 2.2 Windows: si no abre http://localhost:15672 (Chocolatey / servicio)
+
+Esta subsección resume causas frecuentes en **Windows** cuando el servicio **RabbitMQ** figura como *Running* pero la UI de gestión no responde, o cuando las herramientas CLI no encuentran el nodo. Documentación relacionada: [Installing on Windows](https://www.rabbitmq.com/docs/install-windows) (incluye cookie y CLI).
+
+#### Comprobar puertos
+
+En PowerShell:
+
+```powershell
+Get-Service | Where-Object { $_.Name -like '*rabbit*' }
+Test-NetConnection -ComputerName localhost -Port 5672
+Test-NetConnection -ComputerName localhost -Port 15672
+```
+
+- Si **5672** está bien pero **15672** falla (`TcpTestSucceeded : False`), casi siempre falta el plugin **`rabbitmq_management`** o no se aplicó tras habilitarlo (reinicio del servicio).
+- Si aparecen errores de Erlang durante `choco install rabbitmq`, el paso automático del plugin puede haber fallado; seguí igualmente los pasos de más abajo **a mano**.
+
+#### Comando `rabbitmq-plugins.bat` / `rabbitmqctl.bat` “no reconocido”
+
+Chocolatey suele actualizar el **PATH**, pero la sesión vieja no lo ve:
+
+```powershell
+refreshenv
+```
+
+Si sigue sin funcionar, no dependas del PATH:
+
+1. Menú Inicio → **RabbitMQ Command Prompt (sbin dir)** (abrís ya en la carpeta `sbin`).
+2. O usá la ruta completa, por ejemplo  
+   `"C:\Program Files\RabbitMQ Server\rabbitmq_server-4.2.5\sbin\rabbitmq-plugins.bat"`  
+   (ajustá la versión del directorio `rabbitmq_server-*`).
+3. Opcional: agregá **`...\rabbitmq_server-VERSION\sbin`** al PATH del sistema y abrí una terminal nueva.
+
+En equipos en español la ruta puede ser **`C:\Archivos de programa\RabbitMQ Server\...`**.
+
+#### `failed to contact rabbit@TU_PC` al listar plugins
+
+Las CLI hablan con el nodo Erlang usando el archivo **`.erlang.cookie`**. El **servicio Windows** suele correr como **LOCAL SYSTEM** y tu usuario puede tener **otro cookie**: las herramientas no autentican y ves `failed to contact rabbit@...`.
+
+1. Pará el servicio (PowerShell **como administrador**):
+
+   ```powershell
+   Stop-Service RabbitMQ
+   ```
+
+2. Copiá el cookie del perfil SYSTEM sobre el de tu usuario (mismo contenido, un solo archivo en tu perfil):
+
+   - Origen típico: `C:\Windows\System32\config\systemprofile\.erlang.cookie`
+   - Destino: `C:\Users\TU_USUARIO\.erlang.cookie`  
+     (reemplazá `TU_USUARIO`; si no existe, creá el archivo copiando el origen.)
+
+3. Arrancá de nuevo:
+
+   ```powershell
+   Start-Service RabbitMQ
+   ```
+
+4. Desde **RabbitMQ Command Prompt**, verificá:
+
+   ```bat
+   rabbitmqctl.bat status
+   ```
+
+   Tiene que responder sin error de contacto. Detalle oficial: [Cookie file location](https://www.rabbitmq.com/docs/install-windows#cookie-file-location).
+
+#### Habilitar la UI de gestión y reiniciar
+
+Cuando `rabbitmqctl.bat status` funcione:
+
+```bat
+rabbitmq-plugins.bat enable rabbitmq_management
+```
+
+```powershell
+Restart-Service RabbitMQ
+```
+
+Volvé a probar http://localhost:15672 y `Test-NetConnection localhost -Port 15672`.
+
+#### Leer `rabbitmqctl.bat status`: ¿management está activo?
+
+Guardar la salida en un archivo ayuda a revisarla con calma. En **Plugins**, si **Enabled plugins:** viene vacío y en **Listeners** solo aparecen **5672** y el puerto interno de clustering (**25672**), **no** hay listener en **15672**: falta habilitar **`rabbitmq_management`** (paso anterior).
+
+Los logs suelen estar en `%AppData%\RabbitMQ\log\` (por ejemplo `rabbit@NOMBRE_HOST.log`).
+
+#### Si nada de lo anterior alcanza
+
+- Desinstalá y reinstalá **Erlang** + **RabbitMQ** con el [instalador oficial](https://www.rabbitmq.com/docs/install-windows), evitando rutas raras si podés.
+- O usá **Docker** (`rabbitmq:3-management`) para saltarte Erlang + servicio en Windows.
+
+---
+
+## 3. Arranque manual (orden sugerido)
+
+### 3.1 Broker RabbitMQ (antes que los microservicios)
+
+Asegurate de que RabbitMQ esté corriendo según la **subsección 2.1** y que puedas entrar a la UI (por ejemplo http://localhost:15672 con `guest`/`guest` si no cambiaste credenciales). Si en Windows la UI no abre pese al servicio activo, revisá la **subsección 2.2**. Detalle extra en el README del repo si necesitás instalación desde cero.
+
+### 3.2 Microservicios (alineado con `comoejecutardeformamanual.md`)
+
+Levantá en **terminales separadas**, **en este orden**:
+
+1. **config-server** (perfil `native` obligatorio):
+
+   ```bash
+   cd config-server
+   mvn spring-boot:run -Dspring-boot.run.profiles=native
+   ```
+
+   Verificar: http://localhost:8888/actuator/health
+
+2. **eureka-server**:
+
+   ```bash
+   cd eureka-server
+   mvn spring-boot:run
+   ```
+
+   Verificar: http://localhost:8761
+
+3. **auth-service**:
+
+   ```bash
+   cd auth-service
+   mvn spring-boot:run
+   ```
+
+   Verificar registro en Eureka: http://localhost:8761
+
+4. **inventory-service** con perfil **rabbitmq** (publica al broker):
+
+   ```bash
+   cd inventory-service
+   mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+   ```
+
+5. **notification-service** con perfil **rabbitmq** (consume y escribe logs):
+
+   ```bash
+   cd notification-service
+   mvn spring-boot:run -Dspring-boot.run.profiles=rabbitmq
+   ```
+
+6. **api-gateway** (entrada HTTP; conviene **después** de que Auth e Inventory figuren en Eureka):
+
+   ```bash
+   cd api-gateway
+   mvn spring-boot:run
+   ```
+
+   Verificar: http://localhost:8080/actuator/health
+
+**Puertos de referencia:** Config 8888, Eureka 8761, Gateway 8080, Auth 8083, Inventory 8082, Notification 8084.
+
+> **Importante:** sin `-Dspring-boot.run.profiles=rabbitmq` en inventory y notification, no estarás usando el adaptador RabbitMQ del proyecto (perfíl distinto / Kafka / defecto según cómo esté definido el `application` activo).
+
+---
+
+## 4. Verificación manual del flujo
+
+### 4.1 Salud rápida
+
+```bash
+curl -s http://localhost:8761/eureka/apps
+curl -s http://localhost:8080/actuator/health
+curl -s http://localhost:8084/actuator/health
+```
+
+### 4.2 Login y creación de producto vía Gateway
+
+En **Git Bash / WSL / macOS / Linux** (con `jq` instalado):
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}' | jq -r '.token')
+
+curl -s -X POST http://localhost:8080/api/inventory/products \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Producto Demo Rabbit","quantity":10,"price":99.99}'
+```
+
+En **PowerShell** podés obtener el token sin `jq`:
+
+```powershell
+$resp = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/auth/login" `
+  -ContentType "application/json" -Body '{"username":"admin","password":"admin123"}'
+$headers = @{ Authorization = "Bearer $($resp.token)"; "Content-Type" = "application/json" }
+Invoke-RestMethod -Method Post -Uri "http://localhost:8080/api/inventory/products" `
+  -Headers $headers -Body '{"name":"Producto Demo Rabbit","quantity":10,"price":99.99}'
+```
+
+**Qué esperar:** respuesta HTTP del inventario con el producto creado; en la terminal del **notification-service** logs del estilo `=== NOTIFICACIÓN RECIBIDA ===` con ID, nombre, cantidad y precio.
+
+---
+
+## 5. Qué mirar en RabbitMQ Management
+
+- **Queues:** cola **`product.created.queue`** — mensajes *Ready* / *Unacked* según ritmo de consumo.
+- **Exchanges:** **`inventory.exchange`** (tipo topic) y el binding con routing key **`product.created`**.
+- Durante la carga con k6, observá si la profundidad de la cola crece de forma sostenida (posible señal de que el consumidor o la red no siguen el ritmo del productor) frente a errores o latencias en el Gateway.
+
+---
+
+## 6. Carga con k6
+
+Creá un archivo (por ejemplo `k6-product-load.js`) en la raíz del repo o donde prefieras:
+
+```javascript
+import http from "k6/http";
+import { check, sleep } from "k6";
+
+export const options = {
+  stages: [
+    { duration: "30s", target: 10 },
+    { duration: "1m", target: 50 },
+    { duration: "30s", target: 0 },
+  ],
+  thresholds: {
+    http_req_failed: ["rate<0.05"],
+    http_req_duration: ["p(95)<3000"],
+  },
+};
+
+export default function () {
+  const loginRes = http.post(
+    "http://localhost:8080/auth/login",
+    JSON.stringify({ username: "admin", password: "admin123" }),
+    { headers: { "Content-Type": "application/json" } }
+  );
+  const okLogin = check(loginRes, {
+    "login 200": (r) => r.status === 200,
+  });
+  if (!okLogin) return;
+
+  let token;
+  try {
+    token = loginRes.json("token");
+  } catch (e) {
+    return;
+  }
+
+  const payload = JSON.stringify({
+    name: `Load-${__VU}-${__ITER}`,
+    quantity: 1,
+    price: 10,
+  });
+
+  const createRes = http.post(
+    "http://localhost:8080/api/inventory/products",
+    payload,
+    {
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+
+  check(createRes, {
+    "create 200": (r) => r.status === 200,
+  });
+
+  sleep(1);
+}
+```
+
+Ejecutá (ajustá la URL si no es localhost):
+
+```bash
+k6 run k6-product-load.js
+```
+
+Al terminar, k6 imprime **tasas de error**, **percentiles de duración** y **RPS**. Contrastá eso con la profundidad de **`product.created.queue`** en la UI de RabbitMQ y con los logs del notification-service.
+
+---
+
+## 7. Preguntas guía (para cerrar la práctica)
+
+- Si los HTTP codes están bien pero la cola crece, ¿dónde está el cuello de botella?
+- Si fallan muchos logins o creaciones, ¿es auth, gateway, inventario o base H2?
+- ¿El consumidor procesa al mismo ritmo que los mensajes publicados bajo tu escenario de stages?
+
+---
+
+## 8. Resumen del orden
+
+| Orden | Servicio             | Puerto | Notas                              |
+|-------|----------------------|--------|------------------------------------|
+| 0     | RabbitMQ             | 5672 / 15672 | Antes que inventory/notification |
+| 1     | config-server        | 8888   | Perfil `native`                    |
+| 2     | eureka-server        | 8761   |                                    |
+| 3     | auth-service         | 8083   |                                    |
+| 4     | inventory-service    | 8082   | Perfil `rabbitmq`                  |
+| 5     | notification-service | 8084   | Perfil `rabbitmq`                  |
+| 6     | api-gateway          | 8080   | Después de registrados en Eureka   |
+
+Referencias cruzadas: arranque general en **`comoejecutardeformamanual.md`** y variante Docker/README en **`README.md`**.
