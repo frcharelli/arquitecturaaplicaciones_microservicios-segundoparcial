@@ -34,3 +34,9 @@ Además, se modificaron los `Dockerfile` de todos los módulos para contemplar l
 > docker-compose --profile rabbitmq up -d --build
 > ```
 > Una vez arriba, utiliza Postman (o el archivo `.http` provisto) para pedir un JWT, crea un producto (lo cual gatillará un evento que será consumido en order-service) y luego crea una Orden (lo cual enviará un evento que atrapará notification-service). Podrás ver en **Zipkin** (puerto 9411) toda la traza de la petición.
+
+
+
+CREAR ORDEN
+
+Invoke-RestMethod -Method Post -Uri "http://localhost:8085/api/orders" -Headers @{ "Authorization" = "Bearer TU_TOKEN_AQUÍ"; "Content-Type" = "application/json" } -Body '{"productId":"P123","quantity":1}'

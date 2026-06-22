@@ -20,7 +20,7 @@ public class OrderPersistenceAdapter implements OrderRepositoryPort {
         }
         entity.setProductId(order.getProductId());
         entity.setQuantity(order.getQuantity());
-        entity.setStatus(order.getStatus());
+        entity.setStatus(order.getStatus() != null ? order.getStatus() : "CREATED");
         
         OrderJpaEntity saved = repository.save(entity);
         
